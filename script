@@ -1,0 +1,640 @@
+if type(_G.__AzucarScriptsCleanup) == "function" then pcall(_G.__AzucarScriptsCleanup) end
+
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local TextService      = game:GetService("TextService")
+local CoreGui          = game:GetService("CoreGui")
+
+if not (writefile and readfile and isfile and listfiles and makefolder and isfolder and delfile) then
+    warn("[Scripts] Este ejecutor no tiene funciones de archivos (writefile, readfile, listfiles...)")
+    return
+end
+
+local TOGGLE_KEY   = Enum.KeyCode.U -- tecla para mostrar/ocultar la ventana (cámbiala por la que quieras)
+local FOLDER       = "AzucarScripts"
+local AUTORUN_FILE = FOLDER .. "/_autorun.json" -- scripts que se ejecutan solos al abrir
+local CONFIG_FILE  = FOLDER .. "/_config.json"  -- auto-guardado, último script abierto, posición de la ventana
+if not isfolder(FOLDER) then makefolder(FOLDER) end
+
+local running, autorun, conns = {}, {}, {}
+local activeName = nil          -- script abierto ahora (nil = script nuevo sin guardar)
+local lastSaved  = ""           -- último contenido que quedó en el archivo (para no guardar dos veces lo mismo)
+local pendingDel = nil          -- { name, at } cuando se pidió eliminar y falta confirmar
+local config = { autosave = true, last = nil, win = nil }
+
+local PINK    = Color3.fromRGB(255, 130, 195)
+local PINK_D  = Color3.fromRGB(235, 90, 160)
+local PINK_L  = Color3.fromRGB(255, 205, 228)
+local BG      = Color3.fromRGB(255, 245, 250)
+local BG2     = Color3.fromRGB(255, 232, 243)
+local WHITE   = Color3.fromRGB(255, 255, 255)
+local TXT     = Color3.fromRGB(30, 30, 30)
+local TXT_SOFT = Color3.fromRGB(110, 70, 95)
+local TXT_BAD  = Color3.fromRGB(200, 50, 80)
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function corner(o, r) return new("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
+local function stroke(o, c, t) return new("UIStroke", { Color = c, Thickness = t }, o) end
+local function pad(o, n)
+    return new("UIPadding", { PaddingLeft = UDim.new(0, n), PaddingRight = UDim.new(0, n), PaddingTop = UDim.new(0, n), PaddingBottom = UDim.new(0, n) }, o)
+end
+
+local function clean(name)
+    return (tostring(name or ""):gsub("[^%w _%-]", "_"):match("^%s*(.-)%s*$"):sub(1, 40))
+end
+local function path(name) return FOLDER .. "/" .. name .. ".lua" end
+local function short(e) return (tostring(e):gsub("%s+", " "):sub(1, 90)) end
+
+local function normalize(text)
+    text = tostring(text or ""):match("^%s*(.-)%s*$")
+    if text:match("^https?://%S+$") then
+        return 'loadstring(game:HttpGet("' .. text .. '"))()'
+    end
+    return text
+end
+
+local function textWidth(text, size, font)
+    local ok, w = pcall(function() return TextService:GetTextSize(text, size, font, Vector2.new(1000, 30)).X end)
+    if ok and w then return w end
+    return #text * size * 0.6
+end
+
+local function listScripts()
+    local out = {}
+    local ok, files = pcall(listfiles, FOLDER)
+    if ok and type(files) == "table" then
+        for _, f in ipairs(files) do
+            local n = tostring(f):match("([^/\\]+)%.lua$")
+            if n then out[#out + 1] = n end
+        end
+    end
+    table.sort(out, function(a, b) return a:lower() < b:lower() end)
+    return out
+end
+
+local function saveAutorun()
+    local list = {}
+    for n in pairs(autorun) do list[#list + 1] = n end
+    table.sort(list)
+    pcall(writefile, AUTORUN_FILE, HttpService:JSONEncode(list))
+end
+
+local function loadAutorun()
+    if not isfile(AUTORUN_FILE) then return end
+    local ok, list = pcall(function() return HttpService:JSONDecode(readfile(AUTORUN_FILE)) end)
+    if ok and type(list) == "table" then
+        for _, n in ipairs(list) do autorun[n] = true end
+    end
+end
+
+-- Configuración guardada: auto-guardado SÍ/NO, último script abierto y dónde dejaste la ventana.
+local function saveConfig()
+    pcall(writefile, CONFIG_FILE, HttpService:JSONEncode(config))
+end
+local function loadConfig()
+    if not isfile(CONFIG_FILE) then return end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CONFIG_FILE)) end)
+    if ok and type(data) == "table" then
+        if data.autosave ~= nil then config.autosave = data.autosave == true end
+        if type(data.last) == "string" then config.last = data.last end
+        if type(data.win) == "table" then config.win = data.win end
+    end
+end
+
+local gui = new("ScreenGui", { Name = "AzucarScripts", ResetOnSpawn = false, IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 50 })
+pcall(function() gui.Parent = (gethui and gethui()) or CoreGui end)
+
+local WIN_W, WIN_H = 660, 410
+local win = new("Frame", {
+    Name = "Window", Size = UDim2.fromOffset(WIN_W, WIN_H), Position = UDim2.new(0.5, -WIN_W / 2, 0.5, -WIN_H / 2),
+    BackgroundColor3 = BG, BorderSizePixel = 0, ClipsDescendants = true,
+}, gui)
+corner(win, 17)
+stroke(win, PINK, 1.5)
+
+local top = new("Frame", { Name = "Top", Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = PINK, BorderSizePixel = 0 }, win)
+corner(top, 17)
+local topFill = new("Frame", { Name = "TopFill", Size = UDim2.new(1, 0, 0, 17), Position = UDim2.new(0, 0, 1, -17), BackgroundColor3 = PINK, BorderSizePixel = 0 }, top)
+new("TextLabel", {
+    BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -90, 1, 0),
+    Text = "Azucar Scripts", Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Left,
+}, top)
+
+local function topButton(text, x)
+    return new("TextButton", {
+        Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, x, 0.5, -11), BackgroundColor3 = PINK_D,
+        Text = text, Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = WHITE, AutoButtonColor = true,
+    }, top)
+end
+local minBtn   = topButton("-", -64)
+local closeBtn = topButton("X", -34)
+corner(minBtn, 11)
+corner(closeBtn, 11)
+
+local body = new("Frame", { Name = "Body", Position = UDim2.fromOffset(0, 34), Size = UDim2.new(1, 0, 1, -34), BackgroundTransparency = 1 }, win)
+
+local function button(text, w, parent, color, textColor)
+    local b = new("TextButton", {
+        Size = UDim2.fromOffset(w, 28), BackgroundColor3 = color or PINK, Text = text,
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = textColor or WHITE, AutoButtonColor = true,
+    }, parent)
+    corner(b, 14)
+    return b
+end
+
+-- ============================================================
+-- Barra de tabs: cada script guardado es una tab (con su "x" para eliminarlo)
+-- ============================================================
+local tabBar = new("Frame", { Name = "Tabs", Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = BG2, BorderSizePixel = 0 }, body)
+
+local newBtn = button("+ Nuevo script", 108, tabBar)
+newBtn.Position = UDim2.fromOffset(8, 5)
+
+local search = new("TextBox", {
+    Position = UDim2.new(1, -128, 0, 6), Size = UDim2.fromOffset(120, 26), BackgroundColor3 = WHITE,
+    Text = "", PlaceholderText = "Buscar tab", PlaceholderColor3 = TXT_SOFT, Font = Enum.Font.Gotham, TextSize = 12,
+    TextColor3 = TXT, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left,
+}, tabBar)
+corner(search, 13)
+stroke(search, PINK_L, 1)
+new("UIPadding", { PaddingLeft = UDim.new(0, 8) }, search)
+
+-- Las tabs se desplazan de costado ARRASTRANDO con el mouse (o con el dedo), sin barra de scroll.
+local strip = new("ScrollingFrame", {
+    Name = "Strip", Position = UDim2.fromOffset(124, 5), Size = UDim2.new(1, -(124 + 136), 0, 28),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 0, ScrollBarImageTransparency = 1,
+    ScrollingEnabled = false, ScrollingDirection = Enum.ScrollingDirection.X,
+    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.X,
+}, tabBar)
+new("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+    VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 6),
+}, strip)
+new("UIPadding", { PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 8) }, strip)
+
+-- ============================================================
+-- Zona principal: nombre, editor, botones, estado
+-- ============================================================
+local main = new("Frame", { Position = UDim2.fromOffset(0, 38), Size = UDim2.new(1, 0, 1, -38), BackgroundTransparency = 1 }, body)
+
+local nameBox = new("TextBox", {
+    Position = UDim2.fromOffset(10, 8), Size = UDim2.new(1, -20, 0, 28), BackgroundColor3 = WHITE,
+    Text = "", PlaceholderText = "Nombre del script", PlaceholderColor3 = TXT_SOFT, Font = Enum.Font.GothamBold, TextSize = 14,
+    TextColor3 = TXT, ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+corner(nameBox, 14)
+stroke(nameBox, PINK_L, 1)
+new("UIPadding", { PaddingLeft = UDim.new(0, 10) }, nameBox)
+
+local editorFrame = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(10, 42), Size = UDim2.new(1, -20, 1, -144), BackgroundColor3 = WHITE, BorderSizePixel = 0,
+    ScrollBarThickness = 6, ScrollBarImageColor3 = PINK, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.XY,
+    ScrollingDirection = Enum.ScrollingDirection.XY,
+}, main)
+corner(editorFrame, 12)
+stroke(editorFrame, PINK_L, 1)
+
+local editor = new("TextBox", {
+    Size = UDim2.new(1, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.XY, BackgroundTransparency = 1,
+    Text = "", PlaceholderText = "Pega o escribe tu script aquí", PlaceholderColor3 = TXT_SOFT,
+    Font = Enum.Font.Code, TextSize = 14, TextColor3 = TXT, MultiLine = true, ClearTextOnFocus = false,
+    TextWrapped = false, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+}, editorFrame)
+pad(editor, 8)
+
+-- Fila 1: acciones del script
+local actions = new("Frame", { Position = UDim2.new(0, 10, 1, -96), Size = UDim2.new(1, -20, 0, 28), BackgroundTransparency = 1 }, main)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, actions)
+
+local saveBtn    = button("Guardar", 80, actions)
+local runBtn     = button("Ejecutar", 80, actions)
+local stopBtn    = button("Detener", 80, actions)
+local deleteBtn  = button("Eliminar", 80, actions, PINK_D)
+local pasteBtn   = button("Pegar", 70, actions, PINK_L, TXT)
+local stopAllBtn = button("Detener todos", 112, actions, PINK_D)
+for i, b in ipairs({ saveBtn, runBtn, stopBtn, deleteBtn, pasteBtn, stopAllBtn }) do b.LayoutOrder = i end
+
+-- Fila 2: opciones que se recuerdan
+local options = new("Frame", { Position = UDim2.new(0, 10, 1, -64), Size = UDim2.new(1, -20, 0, 28), BackgroundTransparency = 1 }, main)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6) }, options)
+
+local autoSaveBtn = button("Auto-guardar: SÍ", 150, options, PINK_L, TXT)
+local autoRunBtn  = button("Ejecutar al iniciar: NO", 176, options, PINK_L, TXT)
+autoSaveBtn.LayoutOrder, autoRunBtn.LayoutOrder = 1, 2
+
+local status = new("TextLabel", {
+    Position = UDim2.new(0, 10, 1, -30), Size = UDim2.new(1, -20, 0, 22), BackgroundTransparency = 1,
+    Text = "Listo - " .. TOGGLE_KEY.Name .. " para ocultar o mostrar", Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = TXT_SOFT,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+}, main)
+
+local function setStatus(text, bad)
+    status.Text = text
+    status.TextColor3 = bad and TXT_BAD or TXT_SOFT
+end
+
+local renderTabs
+local function currentKey()
+    local k = clean(nameBox.Text)
+    return k ~= "" and k or "sin nombre"
+end
+
+local function refreshToggles()
+    local k = clean(nameBox.Text)
+    local runOn = k ~= "" and autorun[k] == true
+    autoRunBtn.Text = "Ejecutar al iniciar: " .. (runOn and "SÍ" or "NO")
+    autoRunBtn.BackgroundColor3 = runOn and PINK_D or PINK_L
+    autoRunBtn.TextColor3 = runOn and WHITE or TXT
+    autoSaveBtn.Text = "Auto-guardar: " .. (config.autosave and "SÍ" or "NO")
+    autoSaveBtn.BackgroundColor3 = config.autosave and PINK_D or PINK_L
+    autoSaveBtn.TextColor3 = config.autosave and WHITE or TXT
+end
+
+local function isAlive(th) return th ~= nil and coroutine.status(th) ~= "dead" end
+
+local function stopKey(key, quiet)
+    local th = running[key]
+    running[key] = nil
+    if isAlive(th) then
+        pcall(task.cancel, th)
+        if not quiet then setStatus(key .. " detenido") end
+        renderTabs()
+        return true
+    end
+    if not quiet then setStatus(key .. ": no hay nada ejecutándose que detener", true) end
+    return false
+end
+
+local function runCode(key, code)
+    if code == "" then setStatus("No hay nada que ejecutar (código vacío)", true) return end
+    stopKey(key, true)
+    local fn, err = loadstring(code, "=" .. key)
+    if not fn then setStatus(key .. ": error de sintaxis - " .. short(err), true) return end
+    local th = task.spawn(function()
+        local ok, e = pcall(fn)
+        local me = coroutine.running()
+        if running[key] == me then running[key] = nil end
+        if ok then
+            setStatus(key .. " terminó")
+        else
+            setStatus(key .. ": error - " .. short(e), true)
+            warn("[Scripts] " .. key .. ": " .. tostring(e))
+        end
+        renderTabs()
+    end)
+    if isAlive(th) then
+        running[key] = th
+        setStatus(key .. " ejecutándose")
+        renderTabs()
+    end
+end
+
+-- ============================================================
+-- Auto-guardado: el script abierto se guarda solo ~1 segundo después de que dejas de escribir.
+-- Solo aplica a scripts que ya guardaste una vez (los tienes como tab). Nunca pisa un archivo con texto vacío.
+-- ============================================================
+local saveToken = 0
+local function autoSaveNow()
+    if not config.autosave or not activeName then return end
+    if not isfile(path(activeName)) then return end
+    local code = normalize(editor.Text)
+    if code == "" or code == lastSaved then return end
+    local ok, err = pcall(writefile, path(activeName), code)
+    if ok then
+        lastSaved = code
+        setStatus("Auto-guardado: " .. activeName)
+    else
+        setStatus("No se pudo auto-guardar: " .. short(err), true)
+    end
+end
+
+editor:GetPropertyChangedSignal("Text"):Connect(function()
+    if not config.autosave or not activeName then return end
+    saveToken = saveToken + 1
+    local token = saveToken
+    task.delay(1.2, function()
+        if token == saveToken then autoSaveNow() end
+    end)
+end)
+
+-- Arrastre de la fila de tabs (sin barra de scroll)
+local stripDrag, stripMoved = nil, false
+local function beginStripDrag(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    stripDrag = { startX = input.Position.X, startCanvas = strip.CanvasPosition.X, moved = false }
+end
+local function dragBlocksClick()
+    return stripMoved or (stripDrag ~= nil and stripDrag.moved)
+end
+strip.InputBegan:Connect(beginStripDrag)
+conns[#conns + 1] = UserInputService.InputChanged:Connect(function(i)
+    if not stripDrag then return end
+    if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then return end
+    local dx = i.Position.X - stripDrag.startX
+    if not stripDrag.moved and math.abs(dx) > 6 then stripDrag.moved = true end
+    if stripDrag.moved then
+        strip.CanvasPosition = Vector2.new(stripDrag.startCanvas - dx, 0)
+    end
+end)
+conns[#conns + 1] = UserInputService.InputEnded:Connect(function(i)
+    if not stripDrag then return end
+    if i.UserInputType ~= Enum.UserInputType.MouseButton1 and i.UserInputType ~= Enum.UserInputType.Touch then return end
+    if stripDrag.moved then
+        stripMoved = true
+        task.delay(0.15, function() stripMoved = false end)
+    end
+    stripDrag = nil
+end)
+
+-- Si la tab activa quedó fuera de la vista, la trae.
+local function revealActive()
+    task.defer(function()
+        local t = activeName and strip:FindFirstChild(activeName)
+        if not t then return end
+        local left = t.AbsolutePosition.X - strip.AbsolutePosition.X + strip.CanvasPosition.X
+        local right = left + t.AbsoluteSize.X
+        local view = strip.AbsoluteSize.X
+        if left < strip.CanvasPosition.X then
+            strip.CanvasPosition = Vector2.new(math.max(0, left - 4), 0)
+        elseif right > strip.CanvasPosition.X + view then
+            strip.CanvasPosition = Vector2.new(right - view + 4, 0)
+        end
+    end)
+end
+
+local function loadScript(name)
+    autoSaveNow() -- por si venías escribiendo en otro script
+    if not isfile(path(name)) then setStatus("No se encontró el archivo: " .. name, true) renderTabs() return end
+    local ok, content = pcall(readfile, path(name))
+    if not ok then setStatus("No se pudo abrir " .. name .. ": " .. short(content), true) return end
+    activeName = name
+    nameBox.Text = name
+    lastSaved = content
+    editor.Text = content
+    config.last = name
+    saveConfig()
+    refreshToggles()
+    renderTabs()
+    revealActive()
+    setStatus("Abierto " .. name)
+end
+
+local function deleteScript(name)
+    stopKey(name, true)
+    pcall(delfile, path(name))
+    if autorun[name] then autorun[name] = nil saveAutorun() end
+    if activeName == name then
+        activeName = nil
+        nameBox.Text = ""
+        editor.Text = ""
+        lastSaved = ""
+        config.last = nil
+        saveConfig()
+    end
+    refreshToggles()
+    renderTabs()
+    setStatus("Eliminado " .. name)
+end
+
+-- Eliminar pide confirmar: la primera vez avisa, la segunda (dentro de 4 s) borra.
+local function requestDelete(name)
+    if not name or name == "" or not isfile(path(name)) then
+        setStatus("Elige primero un script guardado", true)
+        return
+    end
+    if pendingDel and pendingDel.name == name and os.clock() - pendingDel.at <= 4 then
+        pendingDel = nil
+        deleteScript(name)
+        return
+    end
+    local at = os.clock()
+    pendingDel = { name = name, at = at }
+    setStatus("Pulsa otra vez para eliminar \"" .. name .. "\" (no se puede deshacer)", true)
+    renderTabs()
+    task.delay(4.1, function()
+        if pendingDel and pendingDel.at == at then
+            pendingDel = nil
+            renderTabs()
+        end
+    end)
+end
+
+local function makeTab(name, order)
+    local sel = name == activeName
+    local pend = pendingDel ~= nil and pendingDel.name == name
+    local label = (isAlive(running[name]) and "* " or "") .. name .. (autorun[name] and " (auto)" or "")
+    local w = math.clamp(math.ceil(textWidth(label, 12, Enum.Font.GothamMedium)) + 50, 84, 210)
+
+    local tab = new("Frame", {
+        Name = name, LayoutOrder = order, Size = UDim2.fromOffset(w, 26), BorderSizePixel = 0,
+        BackgroundColor3 = pend and TXT_BAD or (sel and PINK or WHITE),
+    }, strip)
+    corner(tab, 13)
+    stroke(tab, sel and PINK_D or PINK_L, 1)
+
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, -26, 1, 0), BackgroundTransparency = 1, AutoButtonColor = false, Text = label,
+        Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = (sel or pend) and WHITE or TXT,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, tab)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 12) }, btn)
+
+    local x = new("TextButton", {
+        Size = UDim2.fromOffset(18, 18), Position = UDim2.new(1, -22, 0.5, -9), AutoButtonColor = false,
+        BackgroundColor3 = (sel or pend) and PINK_D or PINK_L, Text = pend and "?" or "×",
+        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = (sel or pend) and WHITE or TXT,
+    }, tab)
+    corner(x, 9)
+
+    btn.InputBegan:Connect(beginStripDrag)
+    btn.MouseButton1Click:Connect(function()
+        if dragBlocksClick() then return end
+        loadScript(name)
+    end)
+    x.MouseButton1Click:Connect(function() requestDelete(name) end)
+end
+
+function renderTabs()
+    for _, c in ipairs(strip:GetChildren()) do
+        if c:IsA("GuiObject") then c:Destroy() end
+    end
+    local q = search.Text:lower()
+    local shown = 0
+    for i, name in ipairs(listScripts()) do
+        if q == "" or name:lower():find(q, 1, true) then
+            shown = shown + 1
+            makeTab(name, i)
+        end
+    end
+    if shown == 0 then
+        new("TextLabel", {
+            Name = "_vacio", LayoutOrder = 1, Size = UDim2.fromOffset(260, 26), BackgroundTransparency = 1,
+            Text = q ~= "" and "Ninguna tab coincide con la búsqueda" or "Aún no hay scripts guardados",
+            Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = TXT_SOFT, TextXAlignment = Enum.TextXAlignment.Left,
+        }, strip)
+    end
+end
+
+local function saveScript()
+    local name = clean(nameBox.Text)
+    if name == "" then setStatus("Escribe un nombre primero", true) return end
+    local code = normalize(editor.Text)
+    if code == "" then setStatus("No hay nada que guardar (código vacío)", true) return end
+    local ok, err = pcall(writefile, path(name), code)
+    if not ok then setStatus("No se pudo guardar: " .. short(err), true) return end
+    activeName = name
+    nameBox.Text = name
+    lastSaved = code
+    editor.Text = code
+    config.last = name
+    saveConfig()
+    refreshToggles()
+    renderTabs()
+    revealActive()
+    setStatus("Guardado " .. name .. (config.autosave and " - desde ahora se auto-guarda" or ""))
+end
+
+newBtn.MouseButton1Click:Connect(function()
+    autoSaveNow()
+    activeName = nil
+    nameBox.Text = ""
+    editor.Text = ""
+    lastSaved = ""
+    refreshToggles()
+    renderTabs()
+    setStatus("Script nuevo - ponle nombre y pulsa Guardar (después se auto-guarda)")
+end)
+
+stopAllBtn.MouseButton1Click:Connect(function()
+    local n = 0
+    for key in pairs(running) do
+        if stopKey(key, true) then n = n + 1 end
+    end
+    setStatus(n .. " detenidos")
+end)
+
+search:GetPropertyChangedSignal("Text"):Connect(function() renderTabs() end)
+nameBox:GetPropertyChangedSignal("Text"):Connect(refreshToggles)
+
+saveBtn.MouseButton1Click:Connect(saveScript)
+runBtn.MouseButton1Click:Connect(function() runCode(currentKey(), normalize(editor.Text)) end)
+stopBtn.MouseButton1Click:Connect(function() stopKey(currentKey()) end)
+deleteBtn.MouseButton1Click:Connect(function() requestDelete(clean(nameBox.Text)) end)
+
+pasteBtn.MouseButton1Click:Connect(function()
+    local getclip = getclipboard or (syn and syn.read_clipboard)
+    if not getclip then setStatus("Este ejecutor no tiene acceso al portapapeles (usa Ctrl+V)", true) return end
+    local ok, text = pcall(getclip)
+    if not ok or type(text) ~= "string" or text:match("^%s*$") then setStatus("El portapapeles está vacío", true) return end
+    editor.Text = text
+    setStatus("Pegado desde el portapapeles")
+end)
+
+autoSaveBtn.MouseButton1Click:Connect(function()
+    config.autosave = not config.autosave
+    saveConfig()
+    refreshToggles()
+    if config.autosave then
+        autoSaveNow()
+        setStatus("Auto-guardar activado: tus scripts guardados se guardan solos al escribir")
+    else
+        setStatus("Auto-guardar desactivado: usa Guardar para guardar los cambios")
+    end
+end)
+
+autoRunBtn.MouseButton1Click:Connect(function()
+    local k = clean(nameBox.Text)
+    if k == "" or not isfile(path(k)) then setStatus("Guarda el script primero", true) return end
+    local on = not autorun[k]
+    autorun[k] = on or nil
+    saveAutorun()
+    refreshToggles()
+    renderTabs()
+    setStatus(k .. (on and " se ejecutará solo al abrir" or " ya no se ejecuta solo al abrir"))
+end)
+
+do
+    local minimized = false
+    minBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        body.Visible = not minimized
+        win.Size = UDim2.fromOffset(WIN_W, minimized and 34 or WIN_H)
+        topFill.Visible = not minimized -- minimizada: la barra queda como una píldora redonda
+    end)
+    closeBtn.MouseButton1Click:Connect(function()
+        autoSaveNow()
+        gui.Enabled = false
+    end)
+end
+
+-- Mover la ventana (arrastrando la barra de arriba). La posición queda guardada.
+do
+    local dragging, dragStart, startPos = false, nil, nil
+    top.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, win.Position
+        end
+    end)
+    conns[#conns + 1] = UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    conns[#conns + 1] = UserInputService.InputEnded:Connect(function(i)
+        if (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) and dragging then
+            dragging = false
+            local p = win.Position
+            if p ~= startPos then
+                config.win = { xs = p.X.Scale, xo = p.X.Offset, ys = p.Y.Scale, yo = p.Y.Offset }
+                saveConfig()
+            end
+        end
+    end)
+end
+
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == TOGGLE_KEY and not UserInputService:GetFocusedTextBox() then
+        if gui.Enabled then autoSaveNow() end
+        gui.Enabled = not gui.Enabled
+    end
+end)
+
+_G.__AzucarScriptsCleanup = function()
+    pcall(autoSaveNow)
+    for key in pairs(running) do
+        local th = running[key]
+        running[key] = nil
+        if isAlive(th) then pcall(task.cancel, th) end
+    end
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    pcall(function() gui:Destroy() end)
+end
+
+-- Arranque: cargar lo recordado, abrir el último script y lanzar los de "Ejecutar al iniciar".
+loadAutorun()
+loadConfig()
+if type(config.win) == "table" and tonumber(config.win.xo) and tonumber(config.win.yo) then
+    win.Position = UDim2.new(tonumber(config.win.xs) or 0, config.win.xo, tonumber(config.win.ys) or 0, config.win.yo)
+end
+refreshToggles()
+renderTabs()
+if config.last and isfile(path(config.last)) then
+    loadScript(config.last)
+end
+
+task.spawn(function()
+    task.wait(1.5)
+    local names = {}
+    for n in pairs(autorun) do names[#names + 1] = n end
+    table.sort(names)
+    for _, n in ipairs(names) do
+        if isfile(path(n)) then runCode(n, normalize(readfile(path(n)))) end
+        task.wait(0.3)
+    end
+end)
